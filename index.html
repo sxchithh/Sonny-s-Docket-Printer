@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Phone Order → Docket (Maps Autocomplete + Robust Fallback)</title>
+  <style>
+    :root { --w: 360px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    body { margin: 12px; }
+    form { max-width: var(--w); display: grid; gap: 10px; }
+    label { font-size: 14px; font-weight: 600; }
+    input, textarea, select { font-size: 16px; padding: 10px; border: 1px solid #ccc; border-radius: 8px; width: 100%; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    button { padding: 12px 14px; font-size: 16px; border: 0; border-radius: 10px; background: black; color: white; cursor: pointer; }
+    .ghost { background: #eee; color: #222; }
+    .bar { display:flex; gap:10px; }
+    .hint { color:#666; font-size:12px; }
+    .muted { color:#666; font-size:12px; margin-top:-6px; }
+    .hidden { display:none; }
+    .badge { display:inline-block; padding:2px 6px; border-radius:6px; font-size:12px; }
+    .ok { background:#e6ffed; color:#107e3e; border:1px solid #a7f3d0; }
+    .warn { background:#fff7ed; color:#9a3412; border:1px solid #fed7aa; }
+    .err { background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
+    #mapsStatus { max-width: var(--w); padding:10px; border-radius:10px; margin: 8px 0; }
+
+    /* Print styles for 80mm receipt */
+    @media print {
+      body * { visibility: hidden; }
+      #printArea, #printArea * { visibility: visible; }
+      #printArea { position: fixed; left: 0; top: 0; }
+    }
+    @page { size: 80mm auto; margin: 4mm; }
+
+    /* Receipt */
+    .rcpt { width: 72mm; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 12px; }
+    .rcpt h1 { font-size: 16px; margin: 0 0 2px; text-align: center; }
+    .rcpt .sub { text-align:center; margin-bottom:6px; }
+    .line { border-top: 1px dashed #000; margin: 6px 0; }
+    .kv { display:flex; justify-content: space-between; }
+    .items { white-space: pre-wrap; }
+    .bold { font-weight:700; }
+    .big { font-size: 14px; }
+    .mapline { word-break: break-all; }
+    .diag { max-width: var(--w); border:1px dashed #bbb; border-radius:12px; padding:10px; margin-top:16px; }
+    .diag h3 { margin:0 0 8px; font-size:14px; }
+    .diag .row { grid-template-columns: 1fr auto; }
+  </style>
+</head>
+<body>
+  <div id="mapsStatus" class="hidden"></div>
+
+  <form id="orderForm" autocomplete="on">
+    <h2>Phone Order → Docket</h2>
+
+    <div class="row">
+      <div>
+        <label>Customer Name</label>
+        <input required name="customer_name" placeholder="e.g. John Smith" />
+      </div>
+      <div>
+        <label>Phone</label>
+        <input required name="phone" inputmode="tel" placeholder="04xx xxx xxx" />
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>Order Type</label>
+        <select name="type" id="orderType">
+          <option>Delivery</option>
+          <option>Pickup</option>
+        </select>
+      </div>
+      <div>
+        <label>Quoted Time</label>
+        <input name="eta" placeholder="e.g. 25 min" />
+      </div>
+    </div>
+
+    <div id="addressBlock">
+      <label>Address</label>
+      <input id="address" name="address" placeholder="Start typing address…" autocomplete="street-address" />
+      <div id="addressHelper" class="muted">AU-only suggestions • biased to Adelaide</div>
+      <!-- Hidden structured fields from Places API -->
+      <input type="hidden" name="place_id" id="place_id" />
+      <input type="hidden" name="formatted_address" id="formatted_address" />
+      <input type="hidden" name="lat" id="lat" />
+      <input type="hidden" name="lng" id="lng" />
+      <input type="hidden" name="suburb" id="suburb" />
+      <input type="hidden" name="postcode" id="postcode" />
+    </div>
+
+    <label>Pickup / Delivery Notes</label>
+    <input name="notes" placeholder="Gate code, call on arrival, extra napkins…" />
+
+    <label>Order Details</label>
+    <textarea required name="items" rows="5" placeholder="- Lrg Pepperoni (x1)\n- Garlic Bread (x1)\n- 1.25L Coke (x1)"></textarea>
+
+    <div class="row">
+      <div>
+        <label>Total (AUD)</label>
+        <input name="total" inputmode="decimal" placeholder="e.g. 32.50" />
+      </div>
+      <div>
+        <label>Payment</label>
+        <select name="payment">
+          <option>Pay on Delivery</option>
+          <option>Cash (Pickup)</option>
+          <option>Card in-store</option>
+          <option>Paid Online</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="bar">
+      <button type="submit">Print Docket</button>
+      <button type="button" class="ghost" id="reprint">Reprint Last</button>
+    </div>
+    <div class="hint">Android: enable RawBT Print Service • iPad: use AirPrint-capable receipt printer.</div>
+  </form>
+
+  <!-- Hidden print area -->
+  <div id="printArea" style="display:none"></div>
+
+  <!-- Diagnostics & Tests -->
+  <div class="diag" id="diag">
+    <h3>Diagnostics & Tests</h3>
+    <div class="row">
+      <div>Maps/Places status:</div>
+      <div><span id="diagStatus" class="badge warn">checking…</span></div>
+    </div>
+    <div class="bar" style="margin-top:8px;">
+      <button type="button" class="ghost" id="btnCheckKey">Test 1: Check API Key & Places</button>
+      <button type="button" class="ghost" id="btnTestReprint">Test 2: Reprint Flow</button>
+      <button type="button" class="ghost" id="btnTestMapLink">Test 3: Build Maps Link</button>
+    </div>
+    <div id="diagMsg" class="muted" style="margin-top:6px;"></div>
+  </div>
+
+<script>
+(function(){
+  // ======== CONFIG ========
+  // 🔑 Replace with your actual Maps API key. If left as 'YOUR_API_KEY' or empty, the app will fall back to manual address input.
+  const GMAPS_API_KEY = 'AIzaSyCxJNX7oPF9jq5wZY76d6wgAKtiUsy5hCA';
+  // Optionally enforce Australia bias for Places autocomplete
+  const COUNTRY_RESTRICTION = 'au';
+
+  // ======== DOM refs ========
+  const form = document.getElementById('orderForm');
+  const printArea = document.getElementById('printArea');
+  const reprintBtn = document.getElementById('reprint');
+  const orderType = document.getElementById('orderType');
+  const addressBlock = document.getElementById('addressBlock');
+  const addressInput = document.getElementById('address');
+  const placeIdEl = document.getElementById('place_id');
+  const fmtAddrEl = document.getElementById('formatted_address');
+  const latEl = document.getElementById('lat');
+  const lngEl = document.getElementById('lng');
+  const suburbEl = document.getElementById('suburb');
+  const postcodeEl = document.getElementById('postcode');
+  const mapsStatus = document.getElementById('mapsStatus');
+  const addressHelper = document.getElementById('addressHelper');
+  const diagStatus = document.getElementById('diagStatus');
+  const diagMsg = document.getElementById('diagMsg');
+  const btnCheckKey = document.getElementById('btnCheckKey');
+  const btnTestReprint = document.getElementById('btnTestReprint');
+  const btnTestMapLink = document.getElementById('btnTestMapLink');
+
+  // ======== Utilities ========
+  function nextDocketNumber() {
+    const key = 'docketCounter';
+    let n = parseInt(localStorage.getItem(key) || '0', 10) + 1;
+    localStorage.setItem(key, String(n));
+    return n;
+  }
+  function pad(n, w=4){ return String(n).padStart(w,'0'); }
+  function nowAUS() {
+    try {
+      return new Date().toLocaleString('en-AU', { hour12:false });
+    } catch { return new Date().toString(); }
+  }
+  function saveLast(payload){ localStorage.setItem('lastOrder', JSON.stringify(payload)); }
+  function loadLast(){ try { return JSON.parse(localStorage.getItem('lastOrder')||'null'); } catch { return null; } }
+  function resetAddressFields(){
+    placeIdEl.value = fmtAddrEl.value = latEl.value = lngEl.value = suburbEl.value = postcodeEl.value = '';
+  }
+  function showStatus(type, html){
+    mapsStatus.className = '';
+    mapsStatus.classList.add(type === 'ok' ? 'ok' : type === 'err' ? 'err' : 'warn');
+    mapsStatus.id = 'mapsStatus';
+    mapsStatus.innerHTML = html;
+    mapsStatus.classList.remove('hidden');
+  }
+  function setDiag(statusText, cls, msg){
+    diagStatus.textContent = statusText;
+    diagStatus.className = 'badge ' + cls;
+    if (msg) diagMsg.innerHTML = msg; else diagMsg.textContent = '';
+  }
+
+  function buildMapsLink(o){
+    if (o.lat && o.lng) {
+      return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(o.lat+","+o.lng)}`;
+    }
+    if (o.formatted_address || o.address) {
+      return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(o.formatted_address || o.address)}`;
+    }
+    return '';
+  }
+
+  function buildReceipt(o){
+    const bizName = "SONNY'S PIZZA BAR";    // change to your shop name
+    const bizAddr = "Adelaide · 7 Days"; // tweak as needed
+    const mapLink = o.type === 'Delivery' ? buildMapsLink(o) : '';
+    const hdr = `
+      <div class="rcpt">
+        <h1>${bizName}</h1>
+        <div class="sub">${bizAddr}</div>
+        <div class="kv"><div>Docket: <span class="bold">#${pad(o.docket)}</span></div><div>${o.timestamp}</div></div>
+        <div class="kv"><div>Type: <span class="bold">${o.type}</span></div><div>ETA: ${o.eta||'-'}</div></div>
+        <div class="line"></div>
+        <div><span class="bold big">${o.customer_name}</span></div>
+        <div>☎ ${o.phone}</div>
+        ${o.type === 'Delivery' ? `<div>📍 ${o.formatted_address || o.address || ''}</div>` : '<div>📍 Pickup</div>'}
+        ${mapLink ? `<div class="mapline">🗺️ ${mapLink}</div>` : ''}
+        <div class="line"></div>
+        <div class="bold">ORDER</div>
+        <div class="items">${o.items.trim()}</div>
+        <div class="line"></div>
+        <div class="kv big"><div>Total</div><div class="bold">${o.total ? ('$' + o.total) : '-'}</div></div>
+        <div class="kv"><div>Payment</div><div>${o.payment}</div></div>
+        ${o.notes ? `<div class="line"></div><div>Notes: ${o.notes}</div>` : ''}
+        <div class="line"></div>
+        <div style="text-align:center">Thank you! 🍕</div>
+      </div>
+    `;
+    return hdr;
+  }
+
+  function printReceipt(html){
+    printArea.innerHTML = html;
+    printArea.style.display = 'block';
+    window.print();
+    setTimeout(()=>{ printArea.style.display = 'none'; }, 300);
+  }
+
+  // ======== Form handlers ========
+  orderType.addEventListener('change', () => {
+    const isPickup = orderType.value === 'Pickup';
+    addressBlock.classList.toggle('hidden', isPickup);
+    addressHelper.textContent = isPickup ? 'Pickup selected — address not required.' : (window.__placesReady ? 'AU-only suggestions • biased to Adelaide' : 'Manual entry (Maps not active)');
+    if (isPickup) { addressInput.value = ''; resetAddressFields(); }
+  });
+
+  form.addEventListener('submit', (e)=>{
+    e.preventDefault();
+    const data = Object.fromEntries(new FormData(form).entries());
+    const payload = { ...data, docket: nextDocketNumber(), timestamp: nowAUS() };
+    saveLast(payload);
+    printReceipt(buildReceipt(payload));
+    form.reset();
+    addressBlock.classList.remove('hidden');
+    addressHelper.textContent = window.__placesReady ? 'AU-only suggestions • biased to Adelaide' : 'Manual entry (Maps not active)';
+  });
+
+  reprintBtn.addEventListener('click', ()=>{
+    const last = loadLast();
+    if(!last){ alert('No previous docket found.'); return; }
+    printReceipt(buildReceipt(last));
+  });
+
+  // ======== Google Maps JS Loader with robust error handling ========
+  function initAutocomplete(){
+    if (!window.google || !google.maps || !google.maps.places) return;
+    const options = {
+      componentRestrictions: COUNTRY_RESTRICTION ? { country: COUNTRY_RESTRICTION } : undefined,
+      fields: ['address_components','formatted_address','geometry','place_id'],
+      types: ['geocode'],
+    };
+
+    const ac = new google.maps.places.Autocomplete(addressInput, options);
+
+    // Bias to Greater Adelaide (approx)
+    const adelaideBounds = new google.maps.LatLngBounds(
+      new google.maps.LatLng(-35.30, 138.30), // SW
+      new google.maps.LatLng(-34.50, 139.10)  // NE
+    );
+    ac.setBounds(adelaideBounds);
+    ac.setOptions({ strictBounds: false });
+
+    ac.addListener('place_changed', () => {
+      const place = ac.getPlace();
+      resetAddressFields();
+      if (!place || !place.geometry) return;
+      addressInput.value = place.formatted_address || addressInput.value;
+      placeIdEl.value = place.place_id || '';
+      fmtAddrEl.value = place.formatted_address || '';
+      latEl.value = place.geometry.location.lat();
+      lngEl.value = place.geometry.location.lng();
+      const comps = place.address_components || [];
+      const byType = t => comps.find(c => c.types.includes(t))?.long_name || '';
+      suburbEl.value = byType('locality') || byType('sublocality') || '';
+      postcodeEl.value = byType('postal_code') || '';
+    });
+
+    window.__placesReady = true;
+    showStatus('ok', '✅ <strong>Google Places Autocomplete active.</strong> Type to search addresses.');
+    setDiag('ready', 'ok', 'Places library loaded and initialized.');
+    addressHelper.textContent = 'AU-only suggestions • biased to Adelaide';
+  }
+  window.initAutocomplete = initAutocomplete; // expose for callback
+
+  function loadMapsScript(){
+    if (!GMAPS_API_KEY || GMAPS_API_KEY === 'AIzaSyCxJNX7oPF9jq5wZY76d6wgAKtiUsy5hCA') {
+      window.__placesReady = false;
+      showStatus('warn', '⚠️ <strong>Maps not loaded.</strong> Provide a valid API key to enable address suggestions. You can still type addresses manually.');
+      setDiag('no key', 'warn', 'Replace GMAPS_API_KEY with a valid key. Enable <em>Maps JavaScript API</em> and <em>Places API</em>.');
+      addressHelper.textContent = 'Manual entry (Maps not active)';
+      return;
+    }
+    const s = document.createElement('script');
+    s.async = true; s.defer = true;
+    s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(GMAPS_API_KEY)}&libraries=places&callback=initAutocomplete`;
+    s.onerror = function(){
+      window.__placesReady = false;
+      showStatus('err', '❌ <strong>Maps failed to load.</strong> Check network or key restrictions (HTTP referrers).');
+      setDiag('load error', 'err', 'Script failed to load. Confirm referrer restrictions include this origin and that the key is active.');
+      addressHelper.textContent = 'Manual entry (Maps not active)';
+    };
+    document.head.appendChild(s);
+
+    // Safety timeout if callback never fires (e.g., InvalidKeyMapError or quota/restriction)
+    setTimeout(() => {
+      if (!window.__placesReady) {
+        const hasGoogle = !!(window.google && google.maps);
+        if (hasGoogle) {
+          // Maps core loaded but Places not initialized => likely missing &libraries=places or API restriction
+          showStatus('err', '❌ <strong>Places not available.</strong> Ensure <em>Places API</em> is enabled for this key.');
+          setDiag('maps only', 'err', 'Maps loaded but Places unavailable. Enable Places API for this key.');
+        } else {
+          // Nothing loaded => likely InvalidKeyMapError or blocked by referrer
+          showStatus('err', '❌ <strong>Invalid or restricted API key.</strong> Fix the key, enable Maps JavaScript API + Places API, and set correct HTTP referrers.');
+          setDiag('invalid key?', 'err', 'See https://developers.google.com/maps/documentation/javascript/error-messages#invalid-key-map-error');
+        }
+        addressHelper.textContent = 'Manual entry (Maps not active)';
+      }
+    }, 8000);
+  }
+
+  // ======== Diagnostics buttons ========
+  btnCheckKey.addEventListener('click', () => {
+    if (!GMAPS_API_KEY || GMAPS_API_KEY === 'AIzaSyCxJNX7oPF9jq5wZY76d6wgAKtiUsy5hCA') {
+      setDiag('no key', 'warn', 'GMAPS_API_KEY is missing/placeholder. Add a valid key and reload.');
+    } else if (!window.__placesReady) {
+      setDiag('not ready', 'warn', 'Key present, but Places not ready yet. If it never turns ready, check API restrictions.');
+    } else {
+      setDiag('ready', 'ok', 'Key present and Places active.');
+    }
+  });
+
+  btnTestReprint.addEventListener('click', () => {
+    const mock = {
+      customer_name: 'Test Customer', phone: '0400 000 000', address: '1 Test St, Adelaide SA',
+      formatted_address: '1 Test St, Adelaide SA', place_id: 'TEST', lat: -34.9285, lng: 138.6007,
+      suburb: 'Adelaide', postcode: '5000', items: '- Test Pizza (x1)\n- Garlic Bread (x1)', total: '25.00',
+      payment: 'Cash (Pickup)', type: 'Pickup', eta: '20 min', notes: 'No olives', docket: nextDocketNumber(), timestamp: nowAUS()
+    };
+    saveLast(mock);
+    alert('Mock order saved. Tap "Reprint Last" to verify output.');
+  });
+
+  btnTestMapLink.addEventListener('click', () => {
+    const payload = { address: addressInput.value, formatted_address: fmtAddrEl.value, lat: latEl.value, lng: lngEl.value };
+    const link = buildMapsLink(payload);
+    if (!link) { alert('No link could be built. Enter an address or pick from autocomplete.'); return; }
+    window.open(link, '_blank');
+  });
+
+  // ======== Boot ========
+  // Try to load Maps; fall back to manual if key missing/invalid.
+  loadMapsScript();
+
+})();
+</script>
+
+<!-- NOTE: We now inject the Maps JS dynamically in JS above to handle errors and show clear guidance. -->
+</body>
+</html>
+// Prevent accidental form submit with Enter on non-textareas (e.g., inputs/selects)
+  form.addEventListener('keydown', (e) => {
